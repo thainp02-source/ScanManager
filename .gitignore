@@ -1,0 +1,33 @@
+
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# .NET
+bin/
+obj/
+Debug/
+Release/
+publish/
+
+# SQLite
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+
+# Tai lieu scan
+*.pdf
+ScanManagerTemp/
+ScannedDocuments/
+ScanOutput/
+
+# File tam
+*.tmp
+*.partial
+*.log
+
+# Cau hinh rieng
+.env
+.env.*
