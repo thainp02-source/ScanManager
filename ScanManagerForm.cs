@@ -8,6 +8,7 @@ using System.Threading;
 using NTwain;
 using NTwain.Data;
 using System.Runtime.InteropServices;
+using System.Drawing.Imaging;
 
 namespace ScanManager
 {
@@ -83,6 +84,13 @@ namespace ScanManager
             });
 
             cmbFileType.SelectedIndex = 0;
+            cmbFileType.SelectedIndexChanged += (s, e) =>
+            {
+                btnFinishPdf.Text =
+                    cmbFileType.Text == "PDF"
+                        ? "Hoàn tất PDF"
+                        : "Hoàn tất file";
+            };
             // Cấu hình danh sách máy scan
             cmbScanner.DropDownStyle = ComboBoxStyle.DropDownList;
 
@@ -514,6 +522,7 @@ namespace ScanManager
         }
 
 
+
         private async void btnFinishPdf_Click(
             object? sender,
             EventArgs e)
@@ -530,6 +539,7 @@ namespace ScanManager
             string rootFolder = txtFolder.Text.Trim();
             string documentType = txtDocumentType.Text.Trim();
             string fileName = txtFileName.Text.Trim();
+            string fileType = cmbFileType.Text.Trim().ToUpperInvariant();
 
             if (string.IsNullOrWhiteSpace(rootFolder) ||
                 string.IsNullOrWhiteSpace(fileName))
@@ -546,7 +556,6 @@ namespace ScanManager
                 return;
             }
 
-            // Chụp lại danh sách trang trước khi lưu.
             List<string> pages = scannedPages.ToList();
 
             isSavingPdf = true;
@@ -558,58 +567,20 @@ namespace ScanManager
                     rootFolder,
                     documentType);
 
-                Directory.CreateDirectory(saveFolder);
-
-                string pdfPath = Path.Combine(
+                int fileCount = await ExportAndRecordAsync(
+                    pages,
                     saveFolder,
-                    fileName + ".pdf");
-
-                // Tránh ghi đè tài liệu cũ.
-                if (File.Exists(pdfPath))
-                {
-                    pdfPath = Path.Combine(
-                        saveFolder,
-                        fileName + "_" +
-                        DateTime.Now.ToString(
-                            "yyyyMMdd_HHmmss_fff") +
-                        ".pdf");
-                }
-
-                // Xử lý PDF ở luồng nền.
-                await Task.Run(() =>
-                    CreatePdfFromScanImages(pages, pdfPath));
-
-                // Sau await, cập nhật giao diện và SQLite.
-                SaveDocument(
-                    Path.GetFileName(pdfPath),
-                    documentType,
-                    pdfPath);
-
-                lastPdfPath = pdfPath;
-
-                LoadDocuments();
-
-                // Chỉ xóa ảnh gốc khi PDF và SQLite
-                // đều đã xử lý thành công.
-                foreach (string path in pages)
-                {
-                    try
-                    {
-                        if (File.Exists(path))
-                            File.Delete(path);
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine(
-                            "Không xóa được ảnh quét: " +
-                            ex.Message);
-                    }
-                }
+                    fileName,
+                    fileType,
+                    oneFilePerSheet: false,
+                    duplex: chkDuplex.Checked,
+                    documentType: documentType);
 
                 scannedPages.Clear();
 
                 MessageBox.Show(
-                    $"Đã lưu PDF {pages.Count} trang:\n{pdfPath}",
+                    $"Đã xuất {fileCount} file {fileType}.\n" +
+                    $"Thư mục: {saveFolder}",
                     "Scan Manager",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
@@ -617,8 +588,8 @@ namespace ScanManager
             catch (Exception ex)
             {
                 MessageBox.Show(
-                    "Lỗi lưu PDF:\n" + ex.Message +
-                    "\n\nCác ảnh quét gốc vẫn được giữ lại.",
+                    "Lỗi xuất file:\n" + ex.Message +
+                    "\n\nCác ảnh gốc vẫn được giữ lại.",
                     "Scan Manager",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -629,6 +600,7 @@ namespace ScanManager
                 SetScanningState(false);
             }
         }
+
 
         private string GetWiaFormat(string fileType)
         {
@@ -841,12 +813,13 @@ namespace ScanManager
             });
             cmbScanSource.SelectedIndex = 0;
 
-            // Giá trị mặc định
+            // Giá trị mặc định khi mở ứng dụng
             chkDuplex.Checked = false;
-            chkContinuousScan.Checked = false;
+            chkContinuousScan.Checked = true;
+            chkOnePageOneFile.Checked = false;
 
             // Checkbox: Mỗi trang 1 file PDF
-            chkOnePageOneFile.Text = "Mỗi tờ  1 file PDF";
+            chkOnePageOneFile.Text = "Mỗi tờ 1 file";
             chkOnePageOneFile.AutoSize = true;
             chkOnePageOneFile.ForeColor = Color.Black;
             chkOnePageOneFile.Visible = true;
@@ -1220,6 +1193,178 @@ namespace ScanManager
             }
         }
 
+        private static string GetOutputExtension(string type)
+        {
+            return type.ToUpperInvariant() switch
+            {
+                "PDF" => ".pdf",
+                "JPEG" => ".jpg",
+                "PNG" => ".png",
+                "TIFF" => ".tiff",
+                "BMP" => ".bmp",
+                _ => throw new InvalidOperationException(
+                    "Định dạng file không được hỗ trợ: " + type)
+            };
+        }
+
+        private static string GetUniqueOutputPath(
+            string folder, string name, string extension)
+        {
+            string path = Path.Combine(folder, name + extension);
+
+            int number = 1;
+
+            while (File.Exists(path))
+            {
+                path = Path.Combine(
+                    folder,
+                    $"{name}_{number++:D3}{extension}");
+            }
+
+            return path;
+        }
+
+        // Xuất một ảnh JPG, PNG hoặc BMP.
+        private static void SaveSingleImage(
+            string imagePath,
+            string outputPath,
+            string fileType)
+        {
+            string tempPath = outputPath + ".partial";
+
+            try
+            {
+                string sourceExtension =
+                    Path.GetExtension(imagePath).ToLowerInvariant();
+
+                string targetExtension = GetOutputExtension(fileType);
+
+                // Nếu đã đúng định dạng, giữ nguyên ảnh gốc
+                // bằng cách copy, không mã hóa lại.
+                bool sameFormat =
+                    sourceExtension == targetExtension ||
+                    (sourceExtension == ".jpeg" &&
+                     targetExtension == ".jpg");
+
+                if (sameFormat)
+                {
+                    File.Copy(imagePath, tempPath);
+                }
+                else
+                {
+                    using var image = Image.FromFile(imagePath);
+
+                    switch (fileType)
+                    {
+                        case "JPEG":
+                            SaveScanJpeg(image, tempPath);
+                            break;
+
+                        case "PNG":
+                            image.Save(tempPath, ImageFormat.Png);
+                            break;
+
+                        case "BMP":
+                            image.Save(tempPath, ImageFormat.Bmp);
+                            break;
+
+                        default:
+                            throw new InvalidOperationException(
+                                "Định dạng ảnh không hỗ trợ.");
+                    }
+                }
+
+                File.Move(tempPath, outputPath);
+            }
+            catch
+            {
+                try
+                {
+                    if (File.Exists(tempPath))
+                        File.Delete(tempPath);
+                }
+                catch { }
+
+                throw;
+            }
+        }
+
+        // Xuất một hoặc nhiều trang thành TIFF.
+        private static void SaveMultiPageTiff(
+            IReadOnlyList<string> imagePaths,
+            string outputPath)
+        {
+            if (imagePaths.Count == 0)
+                throw new InvalidOperationException(
+                    "Không có ảnh để tạo TIFF.");
+
+            string tempPath = outputPath + ".partial";
+
+            try
+            {
+                if (imagePaths.Count == 1)
+                {
+                    using var single = new Bitmap(imagePaths[0]);
+                    single.Save(tempPath, ImageFormat.Tiff);
+                }
+                else
+                {
+                    var codec = ImageCodecInfo.GetImageEncoders()
+                        .FirstOrDefault(x =>
+                            x.MimeType == "image/tiff")
+                        ?? throw new InvalidOperationException(
+                            "Windows không có TIFF encoder.");
+
+                    using var first = new Bitmap(imagePaths[0]);
+
+                    using (var start = new EncoderParameters(1))
+                    {
+                        start.Param[0] = new EncoderParameter(
+                            System.Drawing.Imaging.Encoder.SaveFlag,
+                            (long)EncoderValue.MultiFrame);
+
+                        first.Save(tempPath, codec, start);
+                    }
+
+                    for (int i = 1; i < imagePaths.Count; i++)
+                    {
+                        // Chỉ giữ thêm một trang ảnh trong RAM.
+                        using var next = new Bitmap(imagePaths[i]);
+
+                        using var add = new EncoderParameters(1);
+
+                        add.Param[0] = new EncoderParameter(
+                            System.Drawing.Imaging.Encoder.SaveFlag,
+                            (long)EncoderValue.FrameDimensionPage);
+
+                        first.SaveAdd(next, add);
+                    }
+
+                    using (var finish = new EncoderParameters(1))
+                    {
+                        finish.Param[0] = new EncoderParameter(
+                            System.Drawing.Imaging.Encoder.SaveFlag,
+                            (long)EncoderValue.Flush);
+
+                        first.SaveAdd(finish);
+                    }
+                }
+
+                File.Move(tempPath, outputPath);
+            }
+            catch
+            {
+                try
+                {
+                    if (File.Exists(tempPath))
+                        File.Delete(tempPath);
+                }
+                catch { }
+
+                throw;
+            }
+        }
+
         private static void CreatePdfFromScanImages(
             IReadOnlyList<string> pages,
             string pdfPath)
@@ -1366,6 +1511,7 @@ namespace ScanManager
             cmbDpi.Enabled = !busy;
             cmbColorMode.Enabled = !busy;
             cmbScanSource.Enabled = !busy;
+            cmbFileType.Enabled = !busy;
 
             chkDuplex.Enabled = !busy;
             chkContinuousScan.Enabled = !busy;
@@ -1858,6 +2004,7 @@ namespace ScanManager
         }
 
 
+
         private async void FinishTwainScan()
         {
             if (twainSession == null)
@@ -1866,6 +2013,7 @@ namespace ScanManager
             List<string> completedPages = twainScannedPages.ToList();
             twainScannedPages.Clear();
 
+            // 1. Đóng TWAIN sau khi quét
             try
             {
                 twainSession.DataTransferred -=
@@ -1882,7 +2030,8 @@ namespace ScanManager
             }
             catch (Exception ex)
             {
-                scannedPages.AddRange(completedPages);
+                scannedPages.AddRange(
+                    completedPages.Where(File.Exists));
 
                 twainSource = null;
                 twainSession = null;
@@ -1907,11 +2056,14 @@ namespace ScanManager
             twainBatchActive = false;
             SetScanningState(false);
 
-            // Nếu có lỗi nhận ảnh thì không tự tạo PDF,
-            // tránh lưu tài liệu thiếu trang.
+            // 2. Kiểm tra lỗi truyền ảnh
             if (twainTransferFailed)
             {
-                scannedPages.AddRange( completedPages.Where(File.Exists));
+                List<string> validPages = completedPages
+                    .Where(File.Exists)
+                    .ToList();
+
+                scannedPages.AddRange(validPages);
 
                 autoBatchMode = false;
                 autoBatchStopping = true;
@@ -1922,9 +2074,8 @@ namespace ScanManager
                 MessageBox.Show(
                     "Có lỗi trong quá trình nhận ảnh TWAIN:\n" +
                     twainTransferError +
-                    "\n\nĐã giữ lại " + completedPages.Count +
-                    " trang nhận thành công.\n" +
-                    "Vui lòng kiểm tra trước khi lưu PDF.",
+                    $"\n\nĐã giữ lại {validPages.Count} trang." +
+                    "\nVui lòng kiểm tra trước khi lưu.",
                     "Lỗi quét tài liệu",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
@@ -1932,12 +2083,15 @@ namespace ScanManager
                 return;
             }
 
-            // Quét TWAIN thông thường.
+            // Lấy định dạng đã chọn
+            string fileType = cmbFileType.Text
+                .Trim()
+                .ToUpperInvariant();
 
-            // Quét TWAIN không dùng Auto Batch.
+            // 3. Quét thông thường, KHÔNG dùng Auto Batch
             if (!autoBatchMode)
             {
-                // Tùy chọn mỗi trang một PDF.
+                // Mỗi tờ giấy một file
                 if (chkOnePageOneFile.Checked &&
                     completedPages.Count > 0)
                 {
@@ -1946,35 +2100,51 @@ namespace ScanManager
 
                     try
                     {
-                        await SavePagesIndividuallyAsync(
-                            completedPages);
+                        // Hàm này đã hỗ trợ:
+                        // PDF, JPEG, PNG, TIFF, BMP
+                        int totalFiles =
+                            await SavePagesIndividuallyAsync(
+                                completedPages);
 
+                        string description;
 
-                        int totalFiles = chkDuplex.Checked
-                            ? completedPages.Count / 2
-                            : completedPages.Count;
+                        if (chkDuplex.Checked &&
+                            (fileType == "PDF" ||
+                             fileType == "TIFF"))
+                        {
+                            description =
+                                "Mỗi file chứa 2 mặt của một tờ giấy.";
+                        }
+                        else if (chkDuplex.Checked)
+                        {
+                            description =
+                                "Mỗi mặt giấy được lưu thành " +
+                                "một file ảnh riêng.";
+                        }
+                        else
+                        {
+                            description =
+                                "Mỗi tờ giấy được lưu thành một file.";
+                        }
 
                         MessageBox.Show(
-                            $"Đã tạo {totalFiles} file PDF.\n" +
-                            (chkDuplex.Checked
-                                ? "Mỗi file chứa 2 mặt của một tờ giấy."
-                                : "Mỗi file chứa 1 mặt của một tờ giấy."),
+                            $"Đã tạo {totalFiles} file {fileType}.\n" +
+                            description,
                             "Scan Manager",
                             MessageBoxButtons.OK,
                             MessageBoxIcon.Information);
-
                     }
                     catch (Exception ex)
                     {
-                        // Chỉ giữ các ảnh chưa được xóa,
-                        // tránh đưa đường dẫn không tồn tại
-                        // vào danh sách quản lý trang.
+                        // Chỉ giữ các ảnh quét còn tồn tại.
                         scannedPages.AddRange(
                             completedPages.Where(File.Exists));
 
                         MessageBox.Show(
-                            "Lỗi lưu từng trang:\n" + ex.Message +
-                            "\n\nCác ảnh chưa lưu vẫn được giữ lại.",
+                            "Lỗi xuất file:\n" +
+                            ex.Message +
+                            "\n\nCác ảnh quét gốc còn tồn tại " +
+                            "được giữ lại để xử lý.",
                             "Scan Manager",
                             MessageBoxButtons.OK,
                             MessageBoxIcon.Error);
@@ -1988,85 +2158,95 @@ namespace ScanManager
                     return;
                 }
 
-                // Chế độ quét Duplex thông thường:
-                // giữ các trang để nhấn Hoàn tất PDF.
+                // Quét bình thường:
+                // Giữ các trang để người dùng
+                // nhấn Hoàn tất rồi xuất theo định dạng đã chọn.
                 scannedPages.AddRange(completedPages);
 
                 MessageBox.Show(
                     $"Đã quét {completedPages.Count} trang.\n" +
-                    $"Tổng số trang: {scannedPages.Count}",
-                    "Scan Manager");
+                    $"Tổng số trang: {scannedPages.Count}\n\n" +
+                    $"Định dạng xuất: {fileType}\n" +
+                    "Nhấn Hoàn tất để lưu tài liệu.",
+                    "Scan Manager",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
 
                 return;
             }
 
-
-            // Auto Batch: mỗi lượt quét có ảnh là một tập.
+            // 4. AUTO BATCH
             if (completedPages.Count > 0)
             {
+                isSavingPdf = true;
+                SetScanningState(false);
+
                 try
                 {
-                    isSavingPdf = true;
-                    SetScanningState(false);
+                    // Tự động xuất theo cmbFileType
+                    // và trạng thái chkOnePageOneFile.
+                    await SaveAutoBatchPdfAsync(completedPages);
 
-                    try
-                    {
-                        await SaveAutoBatchPdfAsync(completedPages);
-                        LogMemoryUsage( $"Đã lưu Auto Batch {completedPages.Count} trang");
-                    }
-                    finally
-                    {
-                        isSavingPdf = false;
-                        SetScanningState(false);
-                    }
+                    // Ghi RAM sau khi lưu xong mỗi tập
+                    LogMemoryUsage(
+                        $"Đã lưu Auto Batch " +
+                        $"{completedPages.Count} trang - {fileType}");
 
-                    // Chỉ đặt lại bộ đếm sau khi lưu thành công.
+                    // Chỉ reset retry sau khi xuất thành công
                     autoBatchRetryCount = 0;
 
                     Debug.WriteLine(
-                        $"AUTO BATCH: Đã lưu {completedPages.Count} trang.");
+                        $"AUTO BATCH: Đã xuất " +
+                        $"{completedPages.Count} trang ({fileType}).");
                 }
                 catch (Exception ex)
                 {
-                    scannedPages.AddRange(completedPages);
+                    // Giữ lại ảnh chưa bị xóa.
+                    scannedPages.AddRange(
+                        completedPages.Where(File.Exists));
 
                     autoBatchMode = false;
                     autoBatchStopping = true;
                     autoBatchTimer?.Stop();
 
-                    SetScanningState(false);
-
                     MessageBox.Show(
-                        "Không thể lưu PDF tự động:\n" +
+                        $"Không thể xuất file {fileType}:\n" +
                         ex.Message +
-                        "\n\nCác ảnh đã nhận được giữ lại.",
+                        "\n\nCác ảnh quét còn tồn tại " +
+                        "được giữ lại để khôi phục.",
                         "Lỗi Auto Batch",
                         MessageBoxButtons.OK,
                         MessageBoxIcon.Error);
 
                     return;
                 }
+                finally
+                {
+                    isSavingPdf = false;
+                    SetScanningState(false);
+                }
             }
             else
             {
                 Debug.WriteLine(
-                    "AUTO BATCH: Không có ảnh, không tạo PDF.");
+                    "AUTO BATCH: Không có ảnh, " +
+                    "không tạo file.");
             }
 
-            // Nếu người dùng đã nhấn Dừng,
-            // không bắt đầu tập tiếp theo.
+            // 5. Nếu đã nhấn Dừng
             if (autoBatchStopping)
             {
                 StopAutoBatchScan();
                 return;
             }
 
-            // Tiếp tục chờ tập tài liệu mới.
+            // 6. Chờ tập tài liệu tiếp theo
             if (autoBatchMode)
             {
                 autoBatchTimer?.Start();
             }
         }
+
 
         private string CreateAutoBatchFolder()
         {
@@ -2128,178 +2308,69 @@ namespace ScanManager
         }
 
 
-        private async Task SavePagesIndividuallyAsync(
+
+        private async Task<int> SavePagesIndividuallyAsync(
             List<string> pages)
         {
-            if (pages == null || pages.Count == 0)
-                return;
+            if (pages.Count == 0)
+                return 0;
 
             string documentType = txtDocumentType.Text.Trim();
-            string filePrefix = txtFileName.Text.Trim();
+            string fileType = cmbFileType.Text.Trim().ToUpperInvariant();
 
-            if (string.IsNullOrWhiteSpace(filePrefix))
-                filePrefix = "To";
+            string prefix = txtFileName.Text.Trim();
 
-            foreach (char c in Path.GetInvalidFileNameChars())
-            {
-                filePrefix = filePrefix.Replace(c, '_');
-            }
+            if (string.IsNullOrWhiteSpace(prefix))
+                prefix = "To";
 
-            // Duplex: 2 mặt quét = 1 tờ giấy.
-            // Simplex: 1 mặt quét = 1 tờ giấy.
-            bool isDuplex = chkDuplex.Checked;
+            bool duplex = chkDuplex.Checked;
 
-            int pagesPerFile = isDuplex ? 2 : 1;
+            string folder = CreateAutoBatchFolder();
 
-            // Kiểm tra đủ cặp mặt trước / mặt sau.
-            if (isDuplex && pages.Count % 2 != 0)
-            {
-                throw new InvalidOperationException(
-                    $"Quét hai mặt nhận được {pages.Count} ảnh.\n" +
-                    "Số ảnh phải chia hết cho 2 để ghép " +
-                    "mỗi tờ thành một PDF.\n" +
-                    "Các ảnh gốc vẫn được giữ lại.");
-            }
-
-            // Tạo thư mục riêng cho mỗi lượt quét.
-            string folderPath = CreateAutoBatchFolder();
-
-            int totalFiles = pages.Count / pagesPerFile;
-            int savedFiles = 0;
-
-            for (int i = 0; i < pages.Count; i += pagesPerFile)
-            {
-                // Danh sách các mặt của cùng một tờ giấy.
-                List<string> sheetPages = new();
-
-                sheetPages.Add(pages[i]);
-
-                if (isDuplex)
-                {
-                    // Mặt sau của tờ giấy.
-                    sheetPages.Add(pages[i + 1]);
-                }
-
-                int sheetNumber = (i / pagesPerFile) + 1;
-
-                string pdfName =
-                    $"{filePrefix}_{sheetNumber:D3}.pdf";
-
-                string pdfPath = Path.Combine(
-                    folderPath,
-                    pdfName);
-
-                // Kiểm tra ảnh trước khi xuất PDF.
-                foreach (string imagePath in sheetPages)
-                {
-                    if (!File.Exists(imagePath))
-                    {
-                        throw new FileNotFoundException(
-                            "Không tìm thấy ảnh đã quét.",
-                            imagePath);
-                    }
-                }
-
-                // Mỗi tờ tạo thành một PDF riêng.
-                // Duplex: PDF chứa 2 trang.
-                // Simplex: PDF chứa 1 trang.
-                await Task.Run(() =>
-                    LowMemoryPdfWriter.CreatePdf(
-                        sheetPages,
-                        pdfPath));
-
-                // Chỉ ghi lịch sử khi PDF đã tạo thành công.
-                SaveDocument(
-                    pdfName,
-                    documentType,
-                    pdfPath);
-
-                lastPdfPath = pdfPath;
-
-                // Chỉ xóa ảnh tạm sau khi đã lưu PDF
-                // và ghi SQLite thành công.
-                foreach (string imagePath in sheetPages)
-                {
-                    try
-                    {
-                        if (File.Exists(imagePath))
-                            File.Delete(imagePath);
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine(
-                            "Không xóa được ảnh tạm: " + ex.Message);
-                    }
-                }
-
-                savedFiles++;
-
-                Debug.WriteLine(
-                    $"Đã lưu {savedFiles}/{totalFiles} tờ: {pdfPath}");
-            }
-
-            // Chỉ tải lại lịch sử một lần.
-            LoadDocuments();
-
-            LogMemoryUsage(
-                $"Đã lưu {savedFiles} tờ thành PDF riêng");
+            return await ExportAndRecordAsync(
+                pages,
+                folder,
+                prefix,
+                fileType,
+                oneFilePerSheet: true,
+                duplex: duplex,
+                documentType: documentType);
         }
 
 
-        private async Task SaveAutoBatchPdfAsync(List<string> pages)
+
+
+        private async Task SaveAutoBatchPdfAsync(
+            List<string> pages)
         {
-            if (pages == null || pages.Count == 0)
+            if (pages.Count == 0)
                 return;
-            // Người dùng chọn mỗi trang một PDF.
+
+            // Mỗi tờ một file: PDF/TIFF ghép mặt;
+            // JPEG/PNG/BMP xuất riêng từng mặt.
             if (chkOnePageOneFile.Checked)
             {
                 await SavePagesIndividuallyAsync(pages);
                 return;
             }
 
-            // Đọc control WinForms trên luồng giao diện.
             string documentType = txtDocumentType.Text.Trim();
+            string fileType = cmbFileType.Text.Trim().ToUpperInvariant();
 
-            // Tạo thư mục riêng cho mỗi tập.
-            string folderPath = CreateAutoBatchFolder();
-            string folderName = Path.GetFileName(folderPath);
+            string folder = CreateAutoBatchFolder();
 
-            string pdfPath = Path.Combine(
-                folderPath,
-                folderName + ".pdf");
+            string prefix = Path.GetFileName(folder);
 
-            // Tạo PDF trên luồng nền, chỉ đọc ảnh từng trang.
-            await Task.Run(() =>
-                LowMemoryPdfWriter.CreatePdf(pages, pdfPath));
-
-            // Sau await trở về luồng giao diện.
-            SaveDocument(
-                Path.GetFileName(pdfPath),
-                documentType,
-                pdfPath);
-
-            lastPdfPath = pdfPath;
-
-            LoadDocuments();
-
-            // Chỉ xóa ảnh tạm sau khi PDF và SQLite thành công.
-            foreach (string imagePath in pages)
-            {
-                try
-                {
-                    if (File.Exists(imagePath))
-                        File.Delete(imagePath);
-                }
-                catch (Exception ex)
-                {
-                    Debug.WriteLine(
-                        "Không xóa được ảnh tạm: " + ex.Message);
-                }
-            }
-
-            Debug.WriteLine(
-                $"AUTO BATCH: Đã lưu {pages.Count} trang: {pdfPath}");
+            await ExportAndRecordAsync(
+                pages,
+                folder,
+                prefix,
+                fileType,
+                oneFilePerSheet: false,
+                duplex: chkDuplex.Checked,
+                documentType: documentType);
         }
+
 
 
         private ScanOptions GetScanOptions()
@@ -2472,6 +2543,253 @@ namespace ScanManager
                 Debug.WriteLine(
                     "Không đọc được RAM: " + ex.Message);
             }
+        }
+
+        private static List<string> ExportScanFiles(
+            IReadOnlyList<string> pages,
+            string folder,
+            string prefix,
+            string fileType,
+            bool oneFilePerSheet,
+            bool duplex)
+        {
+            if (pages.Count == 0)
+                throw new InvalidOperationException(
+                    "Không có trang để xuất file.");
+
+            fileType = fileType.Trim().ToUpperInvariant();
+
+            string extension = GetOutputExtension(fileType);
+
+            bool multiPageType =
+                fileType == "PDF" || fileType == "TIFF";
+
+            if (duplex && pages.Count % 2 != 0)
+            {
+                throw new InvalidOperationException(
+                    $"Quét Duplex nhận được {pages.Count} mặt.\n" +
+                    "Số mặt không chia hết cho 2.\n" +
+                    "Vui lòng kiểm tra giấy bị kẹt hoặc thiếu mặt.\n" +
+                    "Ảnh quét gốc vẫn được giữ lại.");
+            }
+
+            Directory.CreateDirectory(folder);
+
+            List<string> outputFiles = new();
+
+            void ExportGroup(
+                IReadOnlyList<string> group,
+                string outputName)
+            {
+                foreach (string path in group)
+                {
+                    if (!File.Exists(path))
+                        throw new FileNotFoundException(
+                            "Thiếu ảnh quét.", path);
+                }
+
+                string outputPath = GetUniqueOutputPath(
+                    folder, outputName, extension);
+
+                switch (fileType)
+                {
+                    case "PDF":
+                        CreatePdfFromScanImages(
+                            group, outputPath);
+                        break;
+
+                    case "TIFF":
+                        SaveMultiPageTiff(
+                            group, outputPath);
+                        break;
+
+                    case "JPEG":
+                    case "PNG":
+                    case "BMP":
+                        if (group.Count != 1)
+                            throw new InvalidOperationException(
+                                "Định dạng ảnh chỉ hỗ trợ một mặt mỗi file.");
+
+                        SaveSingleImage(
+                            group[0], outputPath, fileType);
+                        break;
+                }
+
+                outputFiles.Add(outputPath);
+            }
+
+            try
+            {
+                // PDF/TIFF thông thường: một tập thành một file.
+                if (multiPageType && !oneFilePerSheet)
+                {
+                    ExportGroup(pages, prefix);
+                }
+                // PDF/TIFF mỗi tờ một file.
+                else if (multiPageType)
+                {
+                    int groupSize = duplex ? 2 : 1;
+
+                    for (int i = 0; i < pages.Count; i += groupSize)
+                    {
+                        string name =
+                            $"{prefix}_{i / groupSize + 1:D3}";
+
+                        var group = pages
+                            .Skip(i)
+                            .Take(groupSize)
+                            .ToArray();
+
+                        ExportGroup(group, name);
+                    }
+                }
+                // JPEG, PNG, BMP: mỗi mặt một file ảnh.
+                else
+                {
+                    for (int i = 0; i < pages.Count; i++)
+                    {
+                        string name;
+
+                        if (duplex)
+                        {
+                            int sheet = i / 2 + 1;
+                            string side =
+                                i % 2 == 0 ? "Truoc" : "Sau";
+
+                            name = $"{prefix}_{sheet:D3}_{side}";
+                        }
+                        else
+                        {
+                            name = $"{prefix}_{i + 1:D3}";
+                        }
+
+                        ExportGroup(
+                            new[] { pages[i] }, name);
+                    }
+                }
+
+                return outputFiles;
+            }
+            catch
+            {
+                // Chưa xóa ảnh quét gốc.
+                // Xóa những output chưa ghi vào SQLite
+                // nếu quá trình tạo file thất bại.
+                foreach (string path in outputFiles)
+                {
+                    try
+                    {
+                        if (File.Exists(path))
+                            File.Delete(path);
+                    }
+                    catch { }
+                }
+
+                throw;
+            }
+        }
+
+        private void SaveDocumentsBatch(
+            IReadOnlyList<string> files,
+            string documentType)
+        {
+            using var conn =
+                new SqliteConnection($"Data Source={dbPath}");
+
+            conn.Open();
+
+            using var transaction = conn.BeginTransaction();
+            using var cmd = conn.CreateCommand();
+
+            cmd.Transaction = transaction;
+
+            cmd.CommandText = @"
+        INSERT INTO Documents
+        (FileName, DocumentType, FilePath, CreatedDate)
+        VALUES (@name, @type, @path, @date)";
+
+            var nameParam =
+                cmd.Parameters.Add("@name", SqliteType.Text);
+
+            var typeParam =
+                cmd.Parameters.Add("@type", SqliteType.Text);
+
+            var pathParam =
+                cmd.Parameters.Add("@path", SqliteType.Text);
+
+            var dateParam =
+                cmd.Parameters.Add("@date", SqliteType.Text);
+
+            typeParam.Value = documentType;
+
+            dateParam.Value =
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm");
+
+            foreach (string file in files)
+            {
+                nameParam.Value = Path.GetFileName(file);
+                pathParam.Value = file;
+
+                cmd.ExecuteNonQuery();
+            }
+
+            transaction.Commit();
+        }
+
+        private async Task<int> ExportAndRecordAsync(
+            List<string> pages,
+            string folder,
+            string prefix,
+            string fileType,
+            bool oneFilePerSheet,
+            bool duplex,
+            string documentType)
+        {
+            foreach (char c in Path.GetInvalidFileNameChars())
+            {
+                prefix = prefix.Replace(c, '_');
+            }
+
+            if (string.IsNullOrWhiteSpace(prefix))
+                prefix = "TaiLieu";
+
+            // Chạy toàn bộ xử lý ảnh ở luồng nền.
+            List<string> outputFiles = await Task.Run(() =>
+                ExportScanFiles(
+                    pages,
+                    folder,
+                    prefix,
+                    fileType,
+                    oneFilePerSheet,
+                    duplex));
+
+            // Quay về UI thread, ghi lịch sử một lần.
+            SaveDocumentsBatch(outputFiles, documentType);
+
+            lastPdfPath = outputFiles.LastOrDefault();
+
+            // Chỉ xóa ảnh gốc khi file đầu ra và
+            // giao dịch SQLite đều thành công.
+            foreach (string imagePath in pages)
+            {
+                try
+                {
+                    if (File.Exists(imagePath))
+                        File.Delete(imagePath);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine(
+                        "Không xóa được ảnh tạm: " + ex.Message);
+                }
+            }
+
+            LoadDocuments();
+
+            LogMemoryUsage(
+                $"Đã xuất {outputFiles.Count} file {fileType}");
+
+            return outputFiles.Count;
         }
 
 
